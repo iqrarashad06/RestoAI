@@ -1,10 +1,13 @@
 """
 RestoAI - Smart Restaurant POS & Demand Forecasting API
-Main Application: backend/main.py with JWT Authentication & RBAC
+Main Application: backend/main.py with Full SaaS Capabilities
+(JWT Auth, RBAC, Table Floor Plan Sync, 1-Click Restock, CSV Export, White-Label Settings)
 """
 
 import os
 import sys
+import io
+import csv
 from datetime import datetime, date, timedelta
 from typing import List, Optional, Dict, Any
 from decimal import Decimal
@@ -17,7 +20,7 @@ for p in [CURRENT_DIR, PARENT_DIR]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from fastapi import FastAPI, Depends, HTTPException, Query, status
+from fastapi import FastAPI, Depends, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
@@ -43,6 +46,7 @@ from backend.app.models.models import (
     DemandForecast,
     InventoryLog,
     InventoryTransactionType,
+    StoreSetting,
 )
 from backend.seed_data import seed_database
 from ml_engine.forecasting import RestaurantDemandForecaster
@@ -52,8 +56,8 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="RestoAI – Smart Restaurant POS & Demand Forecasting API",
-    version="1.1.0",
-    description="Backend services protected with JWT Authentication & Role-Based Access Control (Admin, Manager, Cashier).",
+    version="1.2.0",
+    description="Full-stack commercial restaurant POS, inventory deduction, KDS table floor plan sync, and AI forecasting.",
 )
 
 # Enable CORS for all origins (specifically supporting Vite frontend at http://localhost:5173)
@@ -93,6 +97,29 @@ class LoginResponse(BaseModel):
     user: UserProfileSchema
 
 
+class StoreSettingSchema(BaseModel):
+    id: int
+    restaurant_name: str
+    tagline: str
+    address: str
+    phone: str
+    currency_symbol: str
+    tax_rate: float
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class StoreSettingUpdateSchema(BaseModel):
+    restaurant_name: str = Field(min_length=1, max_length=100)
+    tagline: str = Field(min_length=1, max_length=150)
+    address: str = Field(min_length=1, max_length=255)
+    phone: str = Field(min_length=1, max_length=50)
+    currency_symbol: str = Field(min_length=1, max_length=10)
+    tax_rate: float = Field(ge=0.0, le=50.0)
+
+
 class MenuItemSchema(BaseModel):
     id: int
     name: str
@@ -129,6 +156,22 @@ class InventoryItemSchema(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class RestockRequest(BaseModel):
+    quantity: float = Field(gt=0, default=20.0, description="Quantity to replenish")
+    notes: Optional[str] = "Manual restock replenishment"
+
+
+class TableStatusSchema(BaseModel):
+    table_number: int
+    status: str  # "AVAILABLE" | "OCCUPIED"
+    order_id: Optional[int] = None
+    order_number: Optional[str] = None
+    total_amount: Optional[float] = None
+    customer_name: Optional[str] = None
+    items_count: Optional[int] = None
+    created_at: Optional[datetime] = None
 
 
 class OrderItemCreateSchema(BaseModel):
@@ -194,11 +237,24 @@ def startup_event():
     try:
         user_count = db.query(User).count()
         menu_count = db.query(MenuItem).count()
-        # Also ensure our demo accounts exist
         admin_user = db.query(User).filter(User.email == "admin@restoai.com").first()
+        store_setting = db.query(StoreSetting).first()
+
         if user_count == 0 or menu_count == 0 or not admin_user:
             print("[RestoAI] Empty or incomplete database detected. Running seed script...")
             seed_database()
+        elif not store_setting:
+            default_setting = StoreSetting(
+                restaurant_name="RestoAI Bistro & Lounge",
+                tagline="Smart AI-Powered Hospitality",
+                address="100 Innovation Way, Silicon Valley, CA",
+                phone="(555) 019-2831",
+                currency_symbol="$",
+                tax_rate=8.25,
+            )
+            db.add(default_setting)
+            db.commit()
+            print("[RestoAI] Initialized default store branding settings.")
         else:
             print(f"[RestoAI] Database ready ({menu_count} menu items, {user_count} users).")
     except Exception as e:
@@ -216,7 +272,7 @@ def root():
     return {
         "status": "online",
         "app": "RestoAI – AI-Powered Smart Restaurant POS & Demand Forecasting",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "docs_url": "/docs",
         "auth": "JWT + RBAC Enabled",
     }
@@ -253,7 +309,6 @@ def login(credentials: LoginRequest, db: Session = Depends(get_db)):
 
     role_str = user.role.value if hasattr(user.role, "value") else str(user.role)
 
-    # Generate JWT token
     token_claims = {
         "sub": str(user.id),
         "email": user.email,
@@ -292,8 +347,121 @@ def get_current_user_profile(current_user: User = Depends(get_current_user)):
 
 
 # =====================================================================
-# 1. GET /api/menu — Authenticated (Admin, Manager, Cashier)
-#    PATCH /api/menu/{id}/price — Restricted to Admin & Manager
+# 1. White-Label Restaurant Branding Settings (Admin Only)
+# =====================================================================
+
+@app.get("/api/settings", response_model=StoreSettingSchema, tags=["Store Settings"])
+def get_store_settings(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Returns store branding, currency symbol, and tax rate.
+    Accessible to all authenticated users so POS, receipts, and KDS stay synchronized.
+    """
+    setting = db.query(StoreSetting).first()
+    if not setting:
+        setting = StoreSetting(
+            restaurant_name="RestoAI Bistro & Lounge",
+            tagline="Smart AI-Powered Hospitality",
+            address="100 Innovation Way, Silicon Valley, CA",
+            phone="(555) 019-2831",
+            currency_symbol="$",
+            tax_rate=8.25,
+        )
+        db.add(setting)
+        db.commit()
+        db.refresh(setting)
+    return setting
+
+
+@app.put("/api/settings", response_model=StoreSettingSchema, tags=["Store Settings"])
+def update_store_settings(
+    settings_in: StoreSettingUpdateSchema,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(UserRole.ADMIN)),
+):
+    """
+    Restricted to Admin Only:
+    Customizes restaurant white-label parameters (name, tagline, address, phone, currency, sales tax).
+    Dynamically reflected across POS calculations, receipt prints, and KDS headers.
+    """
+    setting = db.query(StoreSetting).first()
+    if not setting:
+        setting = StoreSetting(**settings_in.dict())
+        db.add(setting)
+    else:
+        setting.restaurant_name = settings_in.restaurant_name
+        setting.tagline = settings_in.tagline
+        setting.address = settings_in.address
+        setting.phone = settings_in.phone
+        setting.currency_symbol = settings_in.currency_symbol
+        setting.tax_rate = settings_in.tax_rate
+        setting.updated_at = datetime.now()
+
+    db.commit()
+    db.refresh(setting)
+    return setting
+
+
+# =====================================================================
+# 2. Interactive Dine-In Table Floor Plan (Tables 1 to 12)
+# =====================================================================
+
+@app.get("/api/tables", response_model=List[TableStatusSchema], tags=["Tables"])
+def get_table_floor_plan_status(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Fetches real-time status of Dine-In Tables 1 through 12.
+    Synchronized with KDS:
+    - Tables with orders in PENDING or PREPARING status are OCCUPIED (Rose Red).
+    - Tables with orders moved to READY or COMPLETED are AVAILABLE (Emerald Green).
+    """
+    tables_result = []
+
+    for table_num in range(1, 13):
+        # Find any active order occupying this table
+        active_order = (
+            db.query(Order)
+            .filter(
+                Order.table_number == table_num,
+                Order.order_type == OrderType.DINE_IN,
+                Order.status.in_([OrderStatus.PENDING, OrderStatus.PREPARING]),
+            )
+            .order_by(desc(Order.created_at))
+            .first()
+        )
+
+        if active_order:
+            tables_result.append({
+                "table_number": table_num,
+                "status": "OCCUPIED",
+                "order_id": active_order.id,
+                "order_number": active_order.order_number,
+                "total_amount": float(active_order.total_amount),
+                "customer_name": active_order.customer_name,
+                "items_count": len(active_order.items),
+                "created_at": active_order.created_at,
+            })
+        else:
+            tables_result.append({
+                "table_number": table_num,
+                "status": "AVAILABLE",
+                "order_id": None,
+                "order_number": None,
+                "total_amount": None,
+                "customer_name": None,
+                "items_count": None,
+                "created_at": None,
+            })
+
+    return tables_result
+
+
+# =====================================================================
+# 3. Menu Endpoints (Catalog & Pricing Management)
 # =====================================================================
 
 @app.get("/api/menu", response_model=List[MenuItemSchema], tags=["Menu"])
@@ -327,10 +495,7 @@ def update_menu_item_price(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.MANAGER)),
 ):
-    """
-    Restricted to Admin & Manager: Update dish sales price or availability.
-    Cashiers will receive 403 Forbidden.
-    """
+    """Restricted to Admin & Manager: Update dish sales price or availability."""
     item = db.query(MenuItem).filter(MenuItem.id == item_id).first()
     if not item:
         raise HTTPException(status_code=404, detail=f"Menu item with ID {item_id} not found.")
@@ -358,7 +523,7 @@ def update_menu_item_price(
 
 
 # =====================================================================
-# 2. GET /api/inventory — Restricted to Admin & Manager (RBAC)
+# 4. Inventory Endpoints (Ledger & 1-Click Restock)
 # =====================================================================
 
 @app.get("/api/inventory", response_model=List[InventoryItemSchema], tags=["Inventory"])
@@ -369,7 +534,6 @@ def get_inventory(
     """
     Restricted to Admin & Manager:
     Fetch raw inventory items with real-time stock levels and low-stock warning flags.
-    Cashiers will receive 403 Forbidden.
     """
     items = db.query(InventoryItem).order_by(InventoryItem.category, InventoryItem.name).all()
     output = []
@@ -391,8 +555,57 @@ def get_inventory(
     return output
 
 
+@app.post("/api/inventory/{item_id}/restock", response_model=InventoryItemSchema, tags=["Inventory"])
+def restock_inventory_item(
+    item_id: int,
+    payload: RestockRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.MANAGER)),
+):
+    """
+    Restricted to Admin & Manager:
+    1-Click Inventory Restock replenishment. Immediately increases stock, updates
+    last_restocked_at timestamp, and writes an audit entry into InventoryLogs.
+    """
+    item = db.query(InventoryItem).filter(InventoryItem.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail=f"Inventory item with ID {item_id} not found.")
+
+    qty = round(float(payload.quantity), 2)
+    item.current_stock = round(item.current_stock + qty, 2)
+    item.last_restocked_at = datetime.now()
+
+    # Create immutable audit log
+    log = InventoryLog(
+        inventory_item_id=item.id,
+        change_amount=qty,
+        transaction_type=InventoryTransactionType.RESTOCK,
+        reference_id=f"RESTOCK-{current_user.username.upper()}",
+        notes=payload.notes or f"Manual restock of +{qty} {item.unit.value if hasattr(item.unit, 'value') else item.unit}",
+        created_at=datetime.now(),
+    )
+    db.add(log)
+    db.commit()
+    db.refresh(item)
+
+    is_low = bool(item.current_stock <= item.minimum_threshold)
+    return {
+        "id": item.id,
+        "name": item.name,
+        "sku": item.sku,
+        "category": item.category.value if hasattr(item.category, "value") else str(item.category),
+        "current_stock": round(float(item.current_stock), 2),
+        "unit": item.unit.value if hasattr(item.unit, "value") else str(item.unit),
+        "minimum_threshold": round(float(item.minimum_threshold), 2),
+        "cost_per_unit": float(item.cost_per_unit),
+        "is_low_stock": is_low,
+        "low_stock": is_low,
+        "last_restocked_at": item.last_restocked_at,
+    }
+
+
 # =====================================================================
-# 3. POST /api/orders — Authenticated (Admin, Manager, Cashier)
+# 5. Orders & POS Transactions (with Dynamic Tax & Recipe Depletion)
 # =====================================================================
 
 @app.post("/api/orders", response_model=OrderSchema, status_code=status.HTTP_201_CREATED, tags=["Orders"])
@@ -403,8 +616,8 @@ def create_order(
 ):
     """
     Submits a new POS order (Authenticated as Cashier, Manager, or Admin):
-    1. Records order under current authenticated cashier.
-    2. Calculates subtotal and 8.25% tax.
+    1. Records order under current authenticated user.
+    2. Calculates subtotal and dynamic tax from StoreSettings.
     3. Traverses Recipes table to automatically deduct raw ingredients from inventory.
     4. Writes an immutable audit log into InventoryLogs.
     """
@@ -446,18 +659,16 @@ def create_order(
             )
         )
 
-        # 2. Recipe Bill-of-Materials: Find raw ingredients to deduct
         recipes = db.query(Recipe).filter(Recipe.menu_item_id == menu_item.id).all()
         for rec in recipes:
             deduction_amount = rec.quantity_required * line.quantity
             inventory_deductions.append((rec.inventory_item_id, deduction_amount, menu_item.name, line.quantity))
 
-    # 3. Apply Inventory Deductions & Audit Logs
+    # 2. Apply Inventory Deductions & Audit Logs
     for inv_id, deduction_qty, item_name, count in inventory_deductions:
         inv_item = db.query(InventoryItem).filter(InventoryItem.id == inv_id).first()
         if inv_item:
             inv_item.current_stock = max(0.0, round(inv_item.current_stock - deduction_qty, 3))
-            
             log = InventoryLog(
                 inventory_item_id=inv_item.id,
                 change_amount=-round(deduction_qty, 3),
@@ -468,9 +679,12 @@ def create_order(
             )
             db.add(log)
 
-    # 4. Calculate Tax, Discount, and Final Total
+    # 3. Dynamic Tax Calculation from StoreSettings
+    store_setting = db.query(StoreSetting).first()
+    tax_percent = Decimal(str(store_setting.tax_rate)) if store_setting else Decimal("8.25")
+    tax_rate = tax_percent / Decimal("100")
+
     discount = Decimal(str(order_payload.discount_amount)).quantize(Decimal("0.01"))
-    tax_rate = Decimal("0.0825")  # 8.25% sales tax
     taxable_amount = max(Decimal("0.00"), subtotal - discount)
     tax_amount = (taxable_amount * tax_rate).quantize(Decimal("0.01"))
     total_amount = taxable_amount + tax_amount
@@ -482,7 +696,7 @@ def create_order(
 
     new_order = Order(
         order_number=order_number,
-        user_id=current_user.id,  # Linked directly to logged-in user!
+        user_id=current_user.id,
         customer_name=order_payload.customer_name or "Guest",
         table_number=order_payload.table_number,
         order_type=order_type_enum,
@@ -501,7 +715,6 @@ def create_order(
     db.commit()
     db.refresh(new_order)
 
-    # Format response
     formatted_items = []
     for item in new_order.items:
         m_item = db.query(MenuItem).filter(MenuItem.id == item.menu_item_id).first()
@@ -534,7 +747,7 @@ def create_order(
 
 
 # =====================================================================
-# 4. GET /api/orders & PATCH /api/orders/{id}/status — Authenticated
+# 6. Kitchen Display System (KDS) & Order Status Workflow
 # =====================================================================
 
 @app.get("/api/orders", response_model=List[OrderSchema], tags=["Orders"])
@@ -598,7 +811,8 @@ def update_order_status(
 ):
     """
     Updates the preparation state of an order (Authenticated):
-    Valid transitions: PENDING -> PREPARING -> READY -> COMPLETED (or CANCELLED).
+    Transitions: PENDING -> PREPARING -> READY -> COMPLETED.
+    When marked READY or COMPLETED, any occupied table immediately becomes AVAILABLE again on the floor plan!
     """
     order = db.query(Order).filter(Order.id == order_id).first()
     if not order:
@@ -651,7 +865,124 @@ def update_order_status(
 
 
 # =====================================================================
-# 5. GET /api/ai/forecast — Restricted to Admin & Manager (RBAC)
+# 7. One-Click Daily Sales & Financial CSV Report (Admin & Manager)
+# =====================================================================
+
+@app.get("/api/reports/sales/csv", tags=["Financial Reports"])
+def export_sales_report_csv(
+    days: int = Query(30, ge=1, le=90, description="Report window in days"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles(UserRole.ADMIN, UserRole.MANAGER)),
+):
+    """
+    Restricted to Admin & Manager:
+    Generates and downloads a clean, well-formatted CSV financial report containing:
+    Order ID, Date, Time, Type, Table, Cashier, Items Sold, Subtotal, Tax, Total Revenue,
+    plus a bottom summary row with grand totals.
+    """
+    cutoff = datetime.now() - timedelta(days=days)
+    orders = (
+        db.query(Order)
+        .filter(Order.created_at >= cutoff, Order.status != OrderStatus.CANCELLED)
+        .order_by(desc(Order.created_at))
+        .all()
+    )
+
+    store_setting = db.query(StoreSetting).first()
+    currency = store_setting.currency_symbol if store_setting else "$"
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    # 1. Header Information
+    writer.writerow(["RESTOAI DAILY SALES & FINANCIAL REPORT"])
+    writer.writerow([f"Generated On: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"])
+    writer.writerow([f"Report Range: Past {days} Days", f"Total Orders: {len(orders)}"])
+    writer.writerow([])  # Blank row
+
+    # 2. Table Column Headers
+    writer.writerow([
+        "Order Number",
+        "Date",
+        "Time",
+        "Order Type",
+        "Table",
+        "Cashier",
+        "Items Sold",
+        f"Subtotal ({currency})",
+        f"Tax ({currency})",
+        f"Total Revenue ({currency})",
+        "Payment Method",
+        "Status",
+    ])
+
+    total_subtotal = Decimal("0.00")
+    total_tax = Decimal("0.00")
+    total_revenue = Decimal("0.00")
+
+    # 3. Data Rows
+    for o in orders:
+        total_subtotal += Decimal(str(o.subtotal))
+        total_tax += Decimal(str(o.tax_amount))
+        total_revenue += Decimal(str(o.total_amount))
+
+        item_summary = "; ".join(
+            f"{it.quantity}x {it.menu_item.name if it.menu_item else f'Item #{it.menu_item_id}'}"
+            for it in o.items
+        )
+
+        cashier_name = o.cashier.full_name if o.cashier else "Staff"
+        table_str = f"Table {o.table_number}" if o.table_number else (
+            o.order_type.value if hasattr(o.order_type, "value") else str(o.order_type)
+        )
+
+        writer.writerow([
+            o.order_number,
+            o.created_at.strftime("%Y-%m-%d"),
+            o.created_at.strftime("%H:%M:%S"),
+            o.order_type.value if hasattr(o.order_type, "value") else str(o.order_type),
+            table_str,
+            cashier_name,
+            item_summary,
+            f"{float(o.subtotal):.2f}",
+            f"{float(o.tax_amount):.2f}",
+            f"{float(o.total_amount):.2f}",
+            o.payment_method.value if hasattr(o.payment_method, "value") else str(o.payment_method),
+            o.status.value if hasattr(o.status, "value") else str(o.status),
+        ])
+
+    # 4. Summary Totals Row at the bottom
+    writer.writerow([])
+    writer.writerow([
+        "TOTALS SUMMARY",
+        f"{len(orders)} Orders",
+        "",
+        "",
+        "",
+        "",
+        "",
+        f"{float(total_subtotal):.2f}",
+        f"{float(total_tax):.2f}",
+        f"{float(total_revenue):.2f}",
+        "",
+        "COMPLETED",
+    ])
+
+    csv_data = output.getvalue()
+    filename = f"restoai_sales_report_{datetime.now().strftime('%Y%m%d')}.csv"
+
+    return Response(
+        content=csv_data,
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}",
+            "Cache-Control": "no-cache",
+        },
+    )
+
+
+# =====================================================================
+# 8. AI Demand Forecasting Engine
 # =====================================================================
 
 @app.get("/api/ai/forecast", tags=["AI Forecasting"])
@@ -663,7 +994,6 @@ def get_ai_demand_forecast(
     """
     Restricted to Admin & Manager:
     Executes the Scikit-Learn time-series forecasting model across 30 days of sales history.
-    Cashiers will receive 403 Forbidden.
     """
     try:
         forecaster = RestaurantDemandForecaster(db=db)
@@ -677,7 +1007,7 @@ def get_ai_demand_forecast(
 
 
 # =====================================================================
-# 6. POST /api/seed — Reset & Re-seed 30 Days of Realistic Data
+# 9. Database Seeding Endpoint
 # =====================================================================
 
 @app.post("/api/seed", tags=["Utility"])

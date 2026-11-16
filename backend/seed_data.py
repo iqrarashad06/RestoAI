@@ -40,6 +40,7 @@ from backend.app.models.models import (
     DemandForecast,
     InventoryLog,
     InventoryTransactionType,
+    StoreSetting,
 )
 
 
@@ -110,6 +111,19 @@ def seed_database():
             db.refresh(u)
         cashiers = [u for u in users_data if u.role == UserRole.CASHIER]
         print(f"      Created {len(users_data)} users.")
+
+        # Seed Store Branding Settings (White-Label Default)
+        store_settings = StoreSetting(
+            restaurant_name="RestoAI Bistro & Lounge",
+            tagline="Smart AI-Powered Hospitality",
+            address="100 Innovation Way, Silicon Valley, CA",
+            phone="(555) 019-2831",
+            currency_symbol="$",
+            tax_rate=8.25,
+        )
+        db.add(store_settings)
+        db.commit()
+        print("      Created default white-label store settings.")
 
         # -------------------------------------------------------------
         # 3. Seed Inventory Items (Raw Ingredients & Packaging)

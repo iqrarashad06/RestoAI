@@ -17,6 +17,7 @@ from backend.app.models.models import (
     DemandForecast,
     InventoryLog,
     InventoryTransactionType,
+    StoreSetting,
 )
 
 __all__ = [
@@ -38,4 +39,5 @@ __all__ = [
     "DemandForecast",
     "InventoryLog",
     "InventoryTransactionType",
+    "StoreSetting",
 ]

@@ -381,3 +381,41 @@ class InventoryLog(Base):
 
     def __repr__(self) -> str:
         return f"<InventoryLog item_id={self.inventory_item_id} change={self.change_amount} type='{self.transaction_type}'>"
+
+
+# ==========================================
+# 9. Store Settings Table (White-Label SaaS Branding)
+# ==========================================
+
+class StoreSetting(Base):
+    """
+    White-label SaaS configuration persisted per restaurant instance.
+    Controls branding, currency symbols, and sales tax across POS, receipts, and reports.
+    """
+    __tablename__ = "store_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    restaurant_name: Mapped[str] = mapped_column(
+        String(100), default="RestoAI Bistro & Lounge", nullable=False
+    )
+    tagline: Mapped[str] = mapped_column(
+        String(150), default="Smart AI-Powered Hospitality", nullable=False
+    )
+    address: Mapped[str] = mapped_column(
+        String(255), default="100 Innovation Way, Silicon Valley, CA", nullable=False
+    )
+    phone: Mapped[str] = mapped_column(
+        String(50), default="(555) 019-2831", nullable=False
+    )
+    currency_symbol: Mapped[str] = mapped_column(
+        String(10), default="$", nullable=False
+    )
+    tax_rate: Mapped[float] = mapped_column(
+        Float, default=8.25, nullable=False
+    )  # percentage e.g. 8.25%
+    updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now(), nullable=True
+    )
+
+    def __repr__(self) -> str:
+        return f"<StoreSetting name='{self.restaurant_name}' currency='{self.currency_symbol}' tax={self.tax_rate}%>"
