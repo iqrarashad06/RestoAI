@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background-color: #0f172a;
+}
+
+/* 80mm Thermal Receipt Print Styles */
+@media print {
+  /* Hide all background dashboard elements when printing */
+  body * {
+    visibility: hidden;
+  }
+
+  /* Display only the thermal receipt container */
+  #thermal-receipt, #thermal-receipt * {
+    visibility: visible;
+  }
+
+  #thermal-receipt {
+    position: fixed;
+    left: 0;
+    top: 0;
+    width: 78mm !important;
+    max-width: 80mm !important;
+    margin: 0 !important;
+    padding: 12px !important;
+    color: #000000 !important;
+    background: #ffffff !important;
+    box-shadow: none !important;
+    border: none !important;
+  }
+
+  /* Suppress browser print header/footer (date, title, URL) */
+  @page {
+    size: 80mm auto;
+    margin: 0;
+  }
+}
